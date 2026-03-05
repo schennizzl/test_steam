@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY alert_bot_requirements.txt /tmp/alert_bot_requirements.txt
+RUN pip install --no-cache-dir -r /tmp/alert_bot_requirements.txt
+
+COPY telegram_alert_bot.py /app/telegram_alert_bot.py
+
+CMD ["python", "/app/telegram_alert_bot.py"]

@@ -1,0 +1,26 @@
+name: steam_dwh
+version: 1.0.0
+config-version: 2
+
+profile: steam_trino
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  steam_dwh:
+    +persist_docs:
+      relation: true
+      columns: true
+    raw:
+      +schema: raw
+      +materialized: table
+    staging:
+      +schema: stg
+      +materialized: view

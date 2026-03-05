@@ -1,0 +1,15 @@
+570	Dota 2	Dota 2	29595
+730	Counter-Strike 2	Counter-Strike	32399
+578080	PUBG: BATTLEGROUNDS	PUBG: BATTLEGROUNDS	493057
+3240220	Grand Theft Auto V Enhanced	Grand Theft Auto V	32982
+1808500	ARC Raiders	ARC Raiders	464339927
+3932890	Escape from Tarkov	Escape from Tarkov	491931
+238960	Path of Exile	Path of Exile	29307
+2694490	Path of Exile 2	Path of Exile 2	1702520304
+582660	Black Desert	Black Desert	386821
+252490	Rust	Rust	263490
+2073620	Arena Breakout: Infinite	Arena Breakout: Infinite	401587136
+2507950	Delta Force	Delta Force	1282866981
+594650	Hunt: Showdown 1896	Hunt: Showdown 1896	500188
+2807960	Battlefield™ 6	Battlefield 6	168648543
+739630	Phasmophobia	Phasmophobia	518184

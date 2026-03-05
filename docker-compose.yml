@@ -1,0 +1,366 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-10-02T17-50-41Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+    secrets:
+      - minio_root_password
+    ports:
+      - "${HOST_BIND_IP:-0.0.0.0}:9000:9000"
+      - "${HOST_BIND_IP:-0.0.0.0}:9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_SECOND_ADMIN_USER: ${MINIO_SECOND_ADMIN_USER}
+    secrets:
+      - minio_root_password
+      - minio_second_admin_password
+    entrypoint: |
+      /bin/sh -c "
+      MINIO_ROOT_PASSWORD=$$(cat /run/secrets/minio_root_password) &&
+      MINIO_SECOND_ADMIN_PASSWORD=$$(cat /run/secrets/minio_second_admin_password) &&
+      until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do
+        sleep 2
+      done &&
+      mc admin user add local $$MINIO_SECOND_ADMIN_USER $$MINIO_SECOND_ADMIN_PASSWORD || true &&
+      mc admin policy attach local consoleAdmin --user $$MINIO_SECOND_ADMIN_USER || true &&
+      mc mb --ignore-existing local/raw &&
+      mc ilm rule add local/raw --expire-days 30 || true &&
+      sleep 5
+      "
+
+  metastore-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${METASTORE_DB_USER}
+      POSTGRES_PASSWORD: ${METASTORE_DB_PASSWORD}
+      POSTGRES_DB: ${METASTORE_DB_NAME}
+    ports:
+      - "${HOST_BIND_IP:-0.0.0.0}:5433:5432"
+    volumes:
+      - metastore-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  hive-metastore:
+    image: ghcr.io/bitsondatadev/hive-metastore:latest
+    depends_on:
+      metastore-db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      METASTORE_TYPE: postgres
+      METASTORE_DB_HOSTNAME: metastore-db
+      METASTORE_DB_PORT: 5432
+      METASTORE_DB_NAME: ${METASTORE_DB_NAME}
+      METASTORE_DB_USER: ${METASTORE_DB_USER}
+      METASTORE_DB_PASSWORD: ${METASTORE_DB_PASSWORD}
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_BUCKET: raw
+      AWS_REGION: us-east-1
+      HIVE_METASTORE_WAREHOUSE_DIR: s3a://raw/warehouse
+    secrets:
+      - minio_root_password
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export S3_SECRET_KEY="$$(cat /run/secrets/minio_root_password)"
+        export AWS_SECRET_ACCESS_KEY="$$S3_SECRET_KEY"
+        exec /entrypoint.sh
+    ports:
+      - "${HOST_BIND_IP:-0.0.0.0}:9083:9083"
+    volumes:
+      - ./hive/metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro
+
+  trino:
+    image: trinodb/trino:449
+    restart: unless-stopped
+    mem_limit: 20g
+    depends_on:
+      - hive-metastore
+      - minio
+    ports:
+      - "${TRINO_BIND_IP:-0.0.0.0}:8082:8443"
+    secrets:
+      - minio_root_password
+      - airflow_admin_password
+      - airflow_second_admin_password
+      - trino_keystore_password
+      - trino_internal_shared_secret
+    volumes:
+      - ./trino/config.properties:/opt/trino/config.properties.template:ro
+      - ./trino/jvm.config:/etc/trino/jvm.config:ro
+      - ./trino/certs:/etc/trino/certs:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        MINIO_ROOT_PASSWORD=$$(cat /run/secrets/minio_root_password)
+        export TRINO_ILYA_PASSWORD=$$(cat /run/secrets/airflow_admin_password)
+        export TRINO_SERGEY_PASSWORD=$$(cat /run/secrets/airflow_second_admin_password)
+        export TRINO_KEYSTORE_PASSWORD=$$(cat /run/secrets/trino_keystore_password)
+        export TRINO_INTERNAL_SHARED_SECRET=$$(cat /run/secrets/trino_internal_shared_secret)
+        cp /opt/trino/config.properties.template /etc/trino/config.properties
+        cat >> /etc/trino/config.properties <<EOF
+        discovery.uri=https://trino:8443
+        http-server.http.enabled=false
+        http-server.https.enabled=true
+        http-server.https.port=8443
+        http-server.https.keystore.path=/etc/trino/certs/trino_keystore.p12
+        http-server.https.keystore.key=$$TRINO_KEYSTORE_PASSWORD
+        http-server.authentication.type=PASSWORD
+        password-authenticator.config-files=/etc/trino/password-authenticator.properties
+        internal-communication.https.required=true
+        internal-communication.shared-secret=$$TRINO_INTERNAL_SHARED_SECRET
+        internal-communication.https.keystore.path=/etc/trino/certs/trino_keystore.p12
+        internal-communication.https.keystore.key=$$TRINO_KEYSTORE_PASSWORD
+        internal-communication.https.truststore.path=/etc/trino/certs/trino_keystore.p12
+        internal-communication.https.truststore.key=$$TRINO_KEYSTORE_PASSWORD
+        EOF
+        if ! grep -q '^node.id=' /etc/trino/node.properties; then
+          echo 'node.id=trino' >> /etc/trino/node.properties
+        fi
+        if ! grep -q '^node.internal-address=' /etc/trino/node.properties; then
+          echo 'node.internal-address=trino' >> /etc/trino/node.properties
+        fi
+        cat > /etc/trino/password-authenticator.properties <<EOF
+        password-authenticator.name=file
+        file.password-file=/etc/trino/password.db
+        EOF
+        python3 - <<'PY'
+        import hashlib
+        import os
+        import secrets
+
+        def pbkdf2(password: str, iterations: int = 10000) -> str:
+            salt = secrets.token_bytes(16)
+            hashed = hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"), salt, iterations, dklen=32)
+            return f"{iterations}:{salt.hex()}:{hashed.hex()}"
+
+        lines = [
+            f"ilya:{pbkdf2(os.environ['TRINO_ILYA_PASSWORD'])}",
+            f"sergey:{pbkdf2(os.environ['TRINO_SERGEY_PASSWORD'])}",
+        ]
+        with open("/etc/trino/password.db", "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        PY
+        cat > /etc/trino/catalog/hive.properties <<EOF
+        connector.name=hive
+        hive.metastore.uri=thrift://hive-metastore:9083
+        hive.s3.aws-access-key=${MINIO_ROOT_USER}
+        hive.s3.aws-secret-key=$$MINIO_ROOT_PASSWORD
+        hive.s3.endpoint=http://minio:9000
+        hive.s3.path-style-access=true
+        hive.s3.ssl.enabled=false
+        hive.non-managed-table-writes-enabled=true
+        EOF
+        rm -f /etc/trino/catalog/tpch.properties /etc/trino/catalog/tpcds.properties
+        exec /usr/lib/trino/bin/run-trino
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import ssl,urllib.request; urllib.request.urlopen('https://localhost:8443/v1/info', context=ssl._create_unverified_context(), timeout=5)"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  airflow-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: wather-airflow:latest
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+      AIRFLOW_VAR_STEAM_API_KEY: ${AIRFLOW_VAR_STEAM_API_KEY}
+      TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID}
+      TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET}
+      AIRFLOW_UID: 50000
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_DEFAULT_REGION: us-east-1
+      TRINO_HOST: trino
+      TRINO_PORT: 8443
+      TRINO_HTTP_SCHEME: https
+      TRINO_USER: ${AIRFLOW_ADMIN_USERNAME}
+      TRINO_PASSWORD_FILE: /run/secrets/airflow_admin_password
+      TRINO_VERIFY: "false"
+      TRINO_CONNECT_TIMEOUT: "3"
+      TRINO_REQUEST_TIMEOUT: "20"
+      TRINO_MAX_ATTEMPTS: "2"
+      TRINO_QUERY_MAX_RUN_TIME: "10m"
+    secrets:
+      - minio_root_password
+      - airflow_admin_password
+      - airflow_second_admin_password
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./:/opt/airflow/project
+    command: >
+      bash -ec "
+      AIRFLOW_ADMIN_PASSWORD=$$(cat /run/secrets/airflow_admin_password) &&
+      AIRFLOW_SECOND_ADMIN_PASSWORD=$$(cat /run/secrets/airflow_second_admin_password) &&
+      MINIO_ROOT_PASSWORD=$$(cat /run/secrets/minio_root_password) &&
+      export MINIO_SECRET_KEY=$$MINIO_ROOT_PASSWORD AWS_SECRET_ACCESS_KEY=$$MINIO_ROOT_PASSWORD &&
+      airflow db upgrade &&
+      airflow users create --username ${AIRFLOW_ADMIN_USERNAME} --password $$AIRFLOW_ADMIN_PASSWORD --firstname Ilya --lastname Admin --role Admin --email ilya@example.com || airflow users reset-password --username ${AIRFLOW_ADMIN_USERNAME} --password $$AIRFLOW_ADMIN_PASSWORD &&
+      airflow users create --username ${AIRFLOW_SECOND_ADMIN_USERNAME} --password $$AIRFLOW_SECOND_ADMIN_PASSWORD --firstname Sergey --lastname Admin --role Admin --email sergey@example.com || airflow users reset-password --username ${AIRFLOW_SECOND_ADMIN_USERNAME} --password $$AIRFLOW_SECOND_ADMIN_PASSWORD &&
+      airflow users delete --username admin || true &&
+      exec airflow scheduler
+      "
+
+  airflow-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    image: wather-airflow:latest
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      airflow-scheduler:
+        condition: service_started
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+      AIRFLOW_VAR_STEAM_API_KEY: ${AIRFLOW_VAR_STEAM_API_KEY}
+      TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID}
+      TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET}
+      AIRFLOW_UID: 50000
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_DEFAULT_REGION: us-east-1
+      TRINO_HOST: trino
+      TRINO_PORT: 8443
+      TRINO_HTTP_SCHEME: https
+      TRINO_USER: ${AIRFLOW_ADMIN_USERNAME}
+      TRINO_PASSWORD_FILE: /run/secrets/airflow_admin_password
+      TRINO_VERIFY: "false"
+      TRINO_CONNECT_TIMEOUT: "3"
+      TRINO_REQUEST_TIMEOUT: "20"
+      TRINO_MAX_ATTEMPTS: "2"
+      TRINO_QUERY_MAX_RUN_TIME: "10m"
+    secrets:
+      - minio_root_password
+      - airflow_admin_password
+    ports:
+      - "${HOST_BIND_IP:-0.0.0.0}:8081:8080"   # Airflow web UI
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./:/opt/airflow/project
+    command: >
+      bash -ec "
+      MINIO_ROOT_PASSWORD=$$(cat /run/secrets/minio_root_password) &&
+      export MINIO_SECRET_KEY=$$MINIO_ROOT_PASSWORD AWS_SECRET_ACCESS_KEY=$$MINIO_ROOT_PASSWORD &&
+      airflow db upgrade &&
+      rm -f /opt/airflow/airflow-webserver.pid /tmp/airflow-webserver.pid &&
+      exec airflow webserver --pid /tmp/airflow-webserver.pid
+      "
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 240s
+
+  telegram-alert-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.alert_bot
+    restart: unless-stopped
+    depends_on:
+      airflow-web:
+        condition: service_healthy
+    environment:
+      COMPOSE_PROJECT_NAME: wather
+      AIRFLOW_BASE_URL: http://airflow-web:8080
+      AIRFLOW_USERNAME: ${AIRFLOW_ADMIN_USERNAME}
+      AIRFLOW_PASSWORD_FILE: /run/secrets/airflow_admin_password
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      ALERT_BOT_POLL_INTERVAL_SECONDS: 30
+      ALERT_BOT_MAX_LOG_LINES: 40
+      ALERT_BOT_PROJECT_ROOT: /opt/alert-bot/project
+      ALERT_BOT_MONITORED_SERVICES: airflow-db,airflow-scheduler,airflow-web,hive-metastore,metastore-db,minio,trino
+    secrets:
+      - airflow_admin_password
+    volumes:
+      - ./:/opt/alert-bot/project:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - alert-bot-state:/state
+
+volumes:
+  minio-data:
+  metastore-db-data:
+  airflow-db-data:
+  alert-bot-state:
+
+secrets:
+  minio_root_password:
+    file: ./secrets/minio_root_password.txt
+  minio_second_admin_password:
+    file: ./secrets/minio_second_admin_password.txt
+  airflow_admin_password:
+    file: ./secrets/airflow_admin_password.txt
+  airflow_second_admin_password:
+    file: ./secrets/airflow_second_admin_password.txt
+  trino_keystore_password:
+    file: ./secrets/trino_keystore_password.txt
+  trino_internal_shared_secret:
+    file: ./secrets/trino_internal_shared_secret.txt

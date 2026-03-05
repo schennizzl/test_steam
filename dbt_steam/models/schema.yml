@@ -1,0 +1,80 @@
+version: 2
+
+models:
+  - name: raw_steam_store_daily
+    columns:
+      - name: payload
+        tests:
+          - not_null
+      - name: upload_dt
+        tests:
+          - not_null
+
+  - name: raw_steam_app_types
+    columns:
+      - name: payload
+        tests:
+          - not_null
+      - name: upload_dt
+        tests:
+          - not_null
+
+  - name: stg_steam_store_daily
+    columns:
+      - name: appid
+        tests:
+          - not_null
+
+  - name: stg_steam_app_types
+    columns:
+      - name: appid
+        tests:
+          - not_null
+
+  - name: raw_steam_game_online
+    columns:
+      - name: payload
+        tests:
+          - not_null
+      - name: upload_dt
+        tests:
+          - not_null
+
+  - name: stg_steam_game_online
+    columns:
+      - name: appid
+        tests:
+          - not_null
+
+  - name: raw_steam_twitch_viewers
+    columns:
+      - name: payload
+        tests:
+          - not_null
+      - name: upload_dt
+        tests:
+          - not_null
+
+  - name: stg_steam_twitch_viewers
+    columns:
+      - name: appid
+        tests:
+          - not_null
+
+  - name: raw_steam_twitch_channels
+    columns:
+      - name: payload
+        tests:
+          - not_null
+      - name: upload_dt
+        tests:
+          - not_null
+
+  - name: stg_steam_twitch_channels
+    columns:
+      - name: appid
+        tests:
+          - not_null
+      - name: twitch_category_id
+        tests:
+          - not_null
