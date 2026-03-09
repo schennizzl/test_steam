@@ -402,8 +402,23 @@ services:
       ALERT_BOT_MAX_LOG_LINES: 40
       ALERT_BOT_PROJECT_ROOT: /opt/alert-bot/project
       ALERT_BOT_MONITORED_SERVICES: airflow-db,airflow-scheduler,airflow-web,hive-metastore,metastore-db,minio,superset,superset-db,trino
+      ALERT_BOT_DAILY_REPORT_TIME: "11:00"
+      ALERT_BOT_DAILY_REPORT_TIMEZONE: Europe/Moscow
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY_FILE: /run/secrets/minio_root_password
+      MINIO_BUCKETS: raw
+      TRINO_HOST: trino
+      TRINO_PORT: 8443
+      TRINO_HTTP_SCHEME: https
+      TRINO_USER: ${AIRFLOW_ADMIN_USERNAME}
+      TRINO_PASSWORD_FILE: /run/secrets/airflow_admin_password
+      TRINO_CATALOG: hive
+      TRINO_SCHEMAS: landing,raw,stg,ods
+      TRINO_VERIFY: "false"
     secrets:
       - airflow_admin_password
+      - minio_root_password
     volumes:
       - ./:/opt/alert-bot/project:ro
       - /var/run/docker.sock:/var/run/docker.sock

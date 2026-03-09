@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import logging
 import os
 import socket
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlparse
+from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 import docker
 import requests
@@ -57,7 +62,12 @@ def env_value(name: str, default: str = "") -> str:
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.data: dict[str, Any] = {"dag_failures": {}, "dag_status": {}, "services": {}}
+        self.data: dict[str, Any] = {
+            "dag_failures": {},
+            "dag_status": {},
+            "services": {},
+            "daily_reports": {},
+        }
         self._load()
 
     def _load(self) -> None:
@@ -270,6 +280,424 @@ class DockerMonitor:
         ]
         return "\n".join(lines)
 
+    def collect_service_states(self) -> list[dict[str, Any]]:
+        service_map = self._containers_by_service()
+        states: list[dict[str, Any]] = []
+        for service_name in sorted(self.monitored_services):
+            container = service_map.get(service_name)
+            if not container:
+                states.append(
+                    {
+                        "service": service_name,
+                        "status": "missing",
+                        "health": None,
+                        "container": None,
+                    }
+                )
+                continue
+            container.reload()
+            state = container.attrs.get("State", {})
+            states.append(
+                {
+                    "service": service_name,
+                    "status": state.get("Status", "unknown"),
+                    "health": state.get("Health", {}).get("Status"),
+                    "container": container,
+                }
+            )
+        return states
+
+    def collect_memory_usage(self, services: list[str] | None = None) -> list[dict[str, Any]]:
+        service_filter = set(services or self.monitored_services)
+        service_map = self._containers_by_service()
+        result: list[dict[str, Any]] = []
+        for service_name in sorted(service_filter):
+            container = service_map.get(service_name)
+            if not container:
+                result.append({"service": service_name, "error": "container not found"})
+                continue
+            try:
+                stats = container.stats(stream=False)
+            except Exception as exc:
+                result.append({"service": service_name, "error": str(exc)})
+                continue
+            memory_stats = stats.get("memory_stats", {})
+            usage = memory_stats.get("usage")
+            stats_values = memory_stats.get("stats", {})
+            cache = (
+                stats_values.get("inactive_file")
+                or stats_values.get("total_inactive_file")
+                or stats_values.get("cache")
+                or 0
+            )
+            working_set = usage - cache if usage is not None else None
+            if working_set is not None and working_set < 0:
+                working_set = 0
+            limit = memory_stats.get("limit")
+            result.append(
+                {
+                    "service": service_name,
+                    "usage_bytes": working_set,
+                    "limit_bytes": limit,
+                }
+            )
+        return result
+
+
+class TrinoReporter:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        password: str,
+        catalog: str,
+        schemas: list[str],
+        http_scheme: str,
+        verify: bool,
+        request_timeout: int,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.catalog = catalog
+        self.schemas = schemas
+        self.http_scheme = http_scheme
+        self.verify = verify
+        self.timeout = request_timeout
+        self.session = requests.Session()
+
+    def _query(self, sql: str) -> list[list[Any]]:
+        base_url = f"{self.http_scheme}://{self.host}:{self.port}"
+        headers = {
+            "X-Trino-User": self.user,
+            "X-Trino-Catalog": self.catalog,
+        }
+        resp = self.session.post(
+            f"{base_url}/v1/statement",
+            data=sql,
+            headers=headers,
+            auth=HTTPBasicAuth(self.user, self.password),
+            timeout=self.timeout,
+            verify=self.verify,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        rows = payload.get("data", [])
+        next_uri = payload.get("nextUri")
+        error = payload.get("error")
+
+        while next_uri and not error:
+            resp = self.session.get(
+                next_uri,
+                auth=HTTPBasicAuth(self.user, self.password),
+                timeout=self.timeout,
+                verify=self.verify,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            rows.extend(payload.get("data", []))
+            next_uri = payload.get("nextUri")
+            error = payload.get("error")
+
+        if error:
+            message = error.get("message", "unknown Trino error")
+            raise RuntimeError(message)
+        return rows
+
+    def collect_tables(self) -> list[dict[str, str]]:
+        if not self.schemas:
+            return []
+        quoted_schemas = []
+        for schema in self.schemas:
+            quoted_schemas.append("'" + schema.replace("'", "''") + "'")
+        schema_list = ",".join(quoted_schemas)
+        query = f"""
+        SELECT table_schema, table_name
+        FROM {self.catalog}.information_schema.tables
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema IN ({schema_list})
+        ORDER BY table_schema, table_name
+        """
+        return [{"schema": table_schema, "table": table_name} for table_schema, table_name in self._query(query)]
+
+
+class MinioReporter:
+    def __init__(
+        self,
+        docker_monitor: DockerMonitor,
+        buckets: list[str],
+        endpoint: str,
+        access_key: str,
+        secret_key: str,
+        request_timeout: int,
+        minio_service_name: str = "minio",
+    ) -> None:
+        self.docker_monitor = docker_monitor
+        self.buckets = buckets
+        self.endpoint = endpoint.rstrip("/")
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.timeout = request_timeout
+        self.minio_service_name = minio_service_name
+        self.session = requests.Session()
+
+    def collect_bucket_sizes(self) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for bucket in self.buckets:
+            total_bytes = 0
+            object_count = 0
+            continuation_token: str | None = None
+            while True:
+                payload = self._list_objects_v2(bucket, continuation_token)
+                namespace = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+                for item in payload.findall("s3:Contents", namespace):
+                    size_text = item.findtext("s3:Size", default="0", namespaces=namespace)
+                    total_bytes += int(size_text)
+                    object_count += 1
+                is_truncated = payload.findtext("s3:IsTruncated", default="false", namespaces=namespace) == "true"
+                if not is_truncated:
+                    break
+                continuation_token = payload.findtext(
+                    "s3:NextContinuationToken",
+                    default="",
+                    namespaces=namespace,
+                ) or None
+            result.append(
+                {
+                    "bucket": bucket,
+                    "bytes": total_bytes,
+                    "objects": object_count,
+                }
+            )
+        return result
+
+    def _list_objects_v2(self, bucket: str, continuation_token: str | None) -> ElementTree.Element:
+        params = {"list-type": "2"}
+        if continuation_token:
+            params["continuation-token"] = continuation_token
+        resp = self._signed_request("GET", f"/{bucket}", params=params)
+        resp.raise_for_status()
+        return ElementTree.fromstring(resp.text)
+
+    def _signed_request(self, method: str, canonical_uri: str, params: dict[str, str]) -> requests.Response:
+        parsed = urlparse(self.endpoint)
+        host = parsed.netloc
+        canonical_query = urlencode(sorted(params.items()))
+        now = datetime.utcnow()
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        canonical_headers = f"host:{host}\nx-amz-content-sha256:UNSIGNED-PAYLOAD\nx-amz-date:{amz_date}\n"
+        signed_headers = "host;x-amz-content-sha256;x-amz-date"
+        canonical_request = "\n".join(
+            [
+                method,
+                canonical_uri,
+                canonical_query,
+                canonical_headers,
+                signed_headers,
+                "UNSIGNED-PAYLOAD",
+            ]
+        )
+        credential_scope = f"{date_stamp}/us-east-1/s3/aws4_request"
+        string_to_sign = "\n".join(
+            [
+                "AWS4-HMAC-SHA256",
+                amz_date,
+                credential_scope,
+                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+            ]
+        )
+        signing_key = self._signature_key(date_stamp)
+        signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        authorization = (
+            "AWS4-HMAC-SHA256 "
+            f"Credential={self.access_key}/{credential_scope}, "
+            f"SignedHeaders={signed_headers}, "
+            f"Signature={signature}"
+        )
+        headers = {
+            "x-amz-date": amz_date,
+            "x-amz-content-sha256": "UNSIGNED-PAYLOAD",
+            "Authorization": authorization,
+        }
+        url = f"{self.endpoint}{canonical_uri}?{canonical_query}"
+        return self.session.request(method, url, headers=headers, timeout=self.timeout)
+
+    def _signature_key(self, date_stamp: str) -> bytes:
+        key_date = hmac.new(("AWS4" + self.secret_key).encode("utf-8"), date_stamp.encode("utf-8"), hashlib.sha256).digest()
+        key_region = hmac.new(key_date, b"us-east-1", hashlib.sha256).digest()
+        key_service = hmac.new(key_region, b"s3", hashlib.sha256).digest()
+        return hmac.new(key_service, b"aws4_request", hashlib.sha256).digest()
+
+    def path_size_bytes(self, path: str) -> int:
+        service_map = self.docker_monitor._containers_by_service()
+        container = service_map.get(self.minio_service_name)
+        if not container:
+            raise RuntimeError("MinIO container not found")
+        size_exec = container.exec_run(["du", "-sb", path])
+        if size_exec.exit_code != 0:
+            output = size_exec.output.decode("utf-8", errors="replace").strip()
+            if "No such file or directory" in output:
+                return 0
+            raise RuntimeError(output or f"du failed for {path}")
+        return int(size_exec.output.decode("utf-8", errors="replace").split()[0])
+
+
+def trino_storage_paths() -> list[dict[str, str]]:
+    return [
+        {"name": "landing", "path": "/data/raw/steam/landing"},
+        {"name": "raw", "path": "/data/raw/warehouse/raw"},
+        {"name": "stg", "path": "/data/raw/warehouse/stg"},
+        {"name": "ods", "path": "/data/raw/warehouse/ods.db"},
+    ]
+
+
+class DailyReportScheduler:
+    def __init__(self, time_of_day: str, timezone_name: str) -> None:
+        hour, minute = self._parse_time(time_of_day)
+        self.hour = hour
+        self.minute = minute
+        self.timezone = ZoneInfo(timezone_name)
+
+    def _parse_time(self, time_of_day: str) -> tuple[int, int]:
+        try:
+            hour_str, minute_str = time_of_day.split(":", 1)
+            hour = int(hour_str)
+            minute = int(minute_str)
+        except Exception as exc:
+            raise ValueError(f"Invalid ALERT_BOT_DAILY_REPORT_TIME={time_of_day!r}") from exc
+        if hour not in range(24) or minute not in range(60):
+            raise ValueError(f"Invalid ALERT_BOT_DAILY_REPORT_TIME={time_of_day!r}")
+        return hour, minute
+
+    def should_send(self, state: StateStore) -> bool:
+        now = datetime.now(self.timezone)
+        scheduled = now.replace(hour=self.hour, minute=self.minute, second=0, microsecond=0)
+        if now < scheduled:
+            return False
+        report_key = f"{self.timezone.key}:{self.hour:02d}:{self.minute:02d}"
+        return state.data.setdefault("daily_reports", {}).get(report_key) != now.date().isoformat()
+
+    def mark_sent(self, state: StateStore) -> None:
+        now = datetime.now(self.timezone)
+        report_key = f"{self.timezone.key}:{self.hour:02d}:{self.minute:02d}"
+        state.data.setdefault("daily_reports", {})[report_key] = now.date().isoformat()
+
+
+def format_bytes(value: int | None) -> str:
+    if value is None:
+        return "n/a"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+        size /= 1024
+    return f"{int(value)} B"
+
+
+def format_ratio(usage: int | None, limit: int | None) -> str:
+    if usage is None:
+        return "n/a"
+    if not limit:
+        return format_bytes(usage)
+    return f"{format_bytes(usage)} / {format_bytes(limit)}"
+
+
+def memory_status(usage: int | None, limit: int | None) -> str:
+    if usage is None or not limit:
+        return "ℹ️"
+    ratio = usage / limit
+    if ratio < 0.7:
+        return "✅"
+    if ratio <= 0.9:
+        return "⚠️"
+    return "❌"
+
+
+def format_percent(usage: int | None, limit: int | None) -> str:
+    if usage is None or not limit:
+        return "n/a"
+    return f"{usage / limit * 100:.1f}%"
+
+
+def build_daily_report(
+    docker_monitor: DockerMonitor,
+    trino_reporter: TrinoReporter,
+    minio_reporter: MinioReporter,
+    timezone_name: str,
+) -> str:
+    lines = [
+        "📊 DAILY CLUSTER REPORT",
+        f"timezone: {timezone_name}",
+    ]
+
+    lines.append("")
+    lines.append("cluster_state:")
+    for item in docker_monitor.collect_service_states():
+        health = item.get("health")
+        suffix = f", health={emoji_for(health, '-')} {health}" if health else ""
+        lines.append(f"- {item['service']}: {emoji_for(item['status'])} {item['status']}{suffix}")
+
+    lines.append("")
+    lines.append("ram_usage:")
+    total_usage_bytes = 0
+    total_limit_bytes = 0
+    seen_limit = False
+    for item in docker_monitor.collect_memory_usage():
+        if item.get("error"):
+            lines.append(f"- {item['service']}: {item['error']}")
+            continue
+        usage = item.get("usage_bytes")
+        limit = item.get("limit_bytes")
+        if usage is not None:
+            total_usage_bytes += usage
+        if limit:
+            total_limit_bytes += limit
+            seen_limit = True
+        lines.append(
+            f"- {item['service']}: {memory_status(usage, limit)} {format_ratio(usage, limit)} ({format_percent(usage, limit)})"
+        )
+    lines.append(
+        f"- total usage memory: {memory_status(total_usage_bytes, total_limit_bytes if seen_limit else None)} "
+        f"{format_ratio(total_usage_bytes, total_limit_bytes if seen_limit else None)} "
+        f"({format_percent(total_usage_bytes, total_limit_bytes if seen_limit else None)})"
+    )
+
+    lines.append("")
+    lines.append("trino_table_storage:")
+    try:
+        storage_groups = []
+        for item in trino_storage_paths():
+            storage_groups.append(
+                {
+                    "name": item["name"],
+                    "bytes": minio_reporter.path_size_bytes(item["path"]),
+                }
+            )
+        total_bytes = sum(item["bytes"] for item in storage_groups)
+        lines.append(f"- total: {format_bytes(total_bytes)}")
+        for item in storage_groups:
+            lines.append(f"- {item['name']}: {format_bytes(item['bytes'])}")
+    except Exception as exc:
+        lines.append(f"- failed to collect Trino table sizes: {exc}")
+
+    lines.append("")
+    lines.append("minio_storage:")
+    try:
+        bucket_sizes = minio_reporter.collect_bucket_sizes()
+        for item in bucket_sizes:
+            lines.append(f"- {item['bucket']}: {format_bytes(item['bytes'])}, objects={item['objects']}")
+    except Exception as exc:
+        lines.append(f"- failed to collect MinIO usage: {exc}")
+
+    report = "\n".join(lines)
+    if len(report) <= 4000:
+        return report
+    return report[:3950] + "\n... report truncated"
+
 
 def configure_logging() -> None:
     level = os.getenv("ALERT_BOT_LOG_LEVEL", "INFO").upper()
@@ -310,6 +738,8 @@ def main() -> int:
     max_log_lines = env_int("ALERT_BOT_MAX_LOG_LINES", 40)
     max_dags = env_int("ALERT_BOT_MAX_DAGS", 100)
     project_name = os.getenv("COMPOSE_PROJECT_NAME", "wather")
+    daily_report_time = os.getenv("ALERT_BOT_DAILY_REPORT_TIME", "11:00")
+    daily_report_timezone = os.getenv("ALERT_BOT_DAILY_REPORT_TIMEZONE", "Europe/Moscow")
     monitored_services = env_csv(
         "ALERT_BOT_MONITORED_SERVICES",
         ["airflow-db", "airflow-scheduler", "airflow-web", "hive-metastore", "metastore-db", "minio", "trino"],
@@ -326,6 +756,26 @@ def main() -> int:
         request_timeout=request_timeout,
     )
     docker_monitor = DockerMonitor(project_name=project_name, monitored_services=monitored_services, max_log_lines=max_log_lines)
+    daily_report_scheduler = DailyReportScheduler(daily_report_time, daily_report_timezone)
+    trino_reporter = TrinoReporter(
+        host=os.getenv("TRINO_HOST", "trino"),
+        port=env_int("TRINO_PORT", 8443),
+        user=os.getenv("TRINO_USER", "ilya"),
+        password=env_value("TRINO_PASSWORD"),
+        catalog=os.getenv("TRINO_CATALOG", "hive"),
+        schemas=env_csv("TRINO_SCHEMAS", ["landing", "raw", "stg", "ods"]),
+        http_scheme=os.getenv("TRINO_HTTP_SCHEME", "https"),
+        verify=os.getenv("TRINO_VERIFY", "false").lower() == "true",
+        request_timeout=request_timeout,
+    )
+    minio_reporter = MinioReporter(
+        docker_monitor=docker_monitor,
+        buckets=env_csv("MINIO_BUCKETS", ["raw"]),
+        endpoint=os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
+        access_key=os.getenv("MINIO_ACCESS_KEY", "admin"),
+        secret_key=env_value("MINIO_SECRET_KEY"),
+        request_timeout=request_timeout,
+    )
 
     LOG.info("Alert bot started on %s for compose project %s", hostname(), project_name)
     if not alerter.enabled():
@@ -431,6 +881,21 @@ def main() -> int:
                     dirty = True
         except Exception:
             LOG.exception("Docker monitoring iteration failed")
+
+        try:
+            if daily_report_scheduler.should_send(state):
+                message = build_daily_report(
+                    docker_monitor=docker_monitor,
+                    trino_reporter=trino_reporter,
+                    minio_reporter=minio_reporter,
+                    timezone_name=daily_report_timezone,
+                )
+                LOG.info("Sending daily cluster report")
+                alerter.send(message)
+                daily_report_scheduler.mark_sent(state)
+                dirty = True
+        except Exception:
+            LOG.exception("Daily report iteration failed")
 
         if dirty:
             state.save()
